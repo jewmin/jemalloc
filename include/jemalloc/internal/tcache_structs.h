@@ -5,9 +5,9 @@
 #include "jemalloc/internal/ql.h"
 #include "jemalloc/internal/sc.h"
 #include "jemalloc/internal/ticker.h"
+#include "jemalloc/internal/tsd_types.h"
 
 /* Various uses of this struct need it to be a named type. */
-typedef struct tsd_s tsd_t;
 typedef ql_elm(tsd_t) tsd_link_t;
 
 struct tcache_s {
@@ -51,6 +51,8 @@ struct tcache_s {
 	szind_t		next_gc_bin;
 	/* For small bins, fill (ncached_max >> lg_fill_div). */
 	uint8_t		lg_fill_div[SC_NBINS];
+	/* For small bins, whether has been refilled since last GC. */
+	bool		bin_refilled[SC_NBINS];
 	/*
 	 * We put the cache bins for large size classes at the end of the
 	 * struct, since some of them might not get used.  This might end up

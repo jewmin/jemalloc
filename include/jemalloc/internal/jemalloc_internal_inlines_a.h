@@ -10,7 +10,9 @@
 JEMALLOC_ALWAYS_INLINE malloc_cpuid_t
 malloc_getcpu(void) {
 	assert(have_percpu_arena);
-#if defined(JEMALLOC_HAVE_SCHED_GETCPU)
+#if defined(_WIN32)
+	return GetCurrentProcessorNumber();
+#elif defined(JEMALLOC_HAVE_SCHED_GETCPU)
 	return (malloc_cpuid_t)sched_getcpu();
 #else
 	not_reached();
@@ -128,8 +130,8 @@ tcache_available(tsd_t *tsd) {
 	if (likely(tsd_tcache_enabled_get(tsd))) {
 		/* Associated arena == NULL implies tcache init in progress. */
 		assert(tsd_tcachep_get(tsd)->arena == NULL ||
-		    tcache_small_bin_get(tsd_tcachep_get(tsd), 0)->avail !=
-		    NULL);
+		    tcache_small_bin_get(tsd_tcachep_get(tsd), 0)->cur_ptr.ptr
+		    != NULL);
 		return true;
 	}
 

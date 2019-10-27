@@ -8,6 +8,17 @@
 #include "jemalloc/internal/sz.h"
 #include "jemalloc/internal/ticker.h"
 
+static inline arena_t *
+arena_get_from_extent(extent_t *extent) {
+	return (arena_t *)atomic_load_p(&arenas[extent_arena_ind_get(extent)],
+	    ATOMIC_RELAXED);
+}
+
+JEMALLOC_ALWAYS_INLINE bool
+arena_has_default_hooks(arena_t *arena) {
+	return (extent_hooks_get(arena) == &extent_hooks_default);
+}
+
 JEMALLOC_ALWAYS_INLINE arena_t *
 arena_choose_maybe_huge(tsd_t *tsd, arena_t *arena, size_t size) {
 	if (arena != NULL) {
@@ -19,7 +30,7 @@ arena_choose_maybe_huge(tsd_t *tsd, arena_t *arena, size_t size) {
 	 * 1) is using auto arena selection (i.e. arena == NULL), and 2) the
 	 * thread is not assigned to a manual arena.
 	 */
-	if (unlikely(size >= huge_threshold)) {
+	if (unlikely(size >= oversize_threshold)) {
 		arena_t *tsd_arena = tsd_arena_get(tsd);
 		if (tsd_arena == NULL || arena_is_auto(tsd_arena)) {
 			return arena_choose_huge(tsd);
@@ -79,13 +90,12 @@ arena_prof_tctx_reset(tsdn_t *tsdn, const void *ptr, prof_tctx_t *tctx) {
 }
 
 JEMALLOC_ALWAYS_INLINE nstime_t
-arena_prof_alloc_time_get(tsdn_t *tsdn, const void *ptr,
-    alloc_ctx_t *alloc_ctx) {
+arena_prof_alloc_time_get(tsdn_t *tsdn, const void *ptr) {
 	cassert(config_prof);
 	assert(ptr != NULL);
 
 	extent_t *extent = iealloc(tsdn, ptr);
-	/* 
+	/*
 	 * Unlike arena_prof_prof_tctx_{get, set}, we only call this once we're
 	 * sure we have a sampled allocation.
 	 */
@@ -94,8 +104,7 @@ arena_prof_alloc_time_get(tsdn_t *tsdn, const void *ptr,
 }
 
 JEMALLOC_ALWAYS_INLINE void
-arena_prof_alloc_time_set(tsdn_t *tsdn, const void *ptr, alloc_ctx_t *alloc_ctx,
-    nstime_t t) {
+arena_prof_alloc_time_set(tsdn_t *tsdn, const void *ptr, nstime_t t) {
 	cassert(config_prof);
 	assert(ptr != NULL);
 
@@ -130,11 +139,30 @@ arena_decay_tick(tsdn_t *tsdn, arena_t *arena) {
 	arena_decay_ticks(tsdn, arena, 1);
 }
 
+/* Purge a single extent to retained / unmapped directly. */
+JEMALLOC_ALWAYS_INLINE void
+arena_decay_extent(tsdn_t *tsdn,arena_t *arena, extent_hooks_t **r_extent_hooks,
+    extent_t *extent) {
+	size_t extent_size = extent_size_get(extent);
+	extent_dalloc_wrapper(tsdn, arena,
+	    r_extent_hooks, extent);
+	if (config_stats) {
+		/* Update stats accordingly. */
+		arena_stats_lock(tsdn, &arena->stats);
+		arena_stats_add_u64(tsdn, &arena->stats,
+		    &arena->decay_dirty.stats->nmadvise, 1);
+		arena_stats_add_u64(tsdn, &arena->stats,
+		    &arena->decay_dirty.stats->purged, extent_size >> LG_PAGE);
+		arena_stats_sub_zu(tsdn, &arena->stats, &arena->stats.mapped,
+		    extent_size);
+		arena_stats_unlock(tsdn, &arena->stats);
+	}
+}
+
 JEMALLOC_ALWAYS_INLINE void *
 arena_malloc(tsdn_t *tsdn, arena_t *arena, size_t size, szind_t ind, bool zero,
     tcache_t *tcache, bool slow_path) {
 	assert(!tsdn_null(tsdn) || tcache == NULL);
-	assert(size != 0);
 
 	if (likely(tcache != NULL)) {
 		if (likely(size <= SC_SMALL_MAXCLASS)) {
@@ -154,7 +182,8 @@ arena_malloc(tsdn_t *tsdn, arena_t *arena, size_t size, szind_t ind, bool zero,
 
 JEMALLOC_ALWAYS_INLINE arena_t *
 arena_aalloc(tsdn_t *tsdn, const void *ptr) {
-	return extent_arena_get(iealloc(tsdn, ptr));
+	return (arena_t *)atomic_load_p(&arenas[extent_arena_ind_get(
+	    iealloc(tsdn, ptr))], ATOMIC_RELAXED);
 }
 
 JEMALLOC_ALWAYS_INLINE size_t
@@ -205,6 +234,16 @@ arena_vsalloc(tsdn_t *tsdn, const void *ptr) {
 }
 
 static inline void
+arena_dalloc_large_no_tcache(tsdn_t *tsdn, void *ptr, szind_t szind) {
+	if (config_prof && unlikely(szind < SC_NBINS)) {
+		arena_dalloc_promoted(tsdn, ptr, NULL, true);
+	} else {
+		extent_t *extent = iealloc(tsdn, ptr);
+		large_dalloc(tsdn, extent);
+	}
+}
+
+static inline void
 arena_dalloc_no_tcache(tsdn_t *tsdn, void *ptr) {
 	assert(ptr != NULL);
 
@@ -227,6 +266,21 @@ arena_dalloc_no_tcache(tsdn_t *tsdn, void *ptr) {
 	if (likely(slab)) {
 		/* Small allocation. */
 		arena_dalloc_small(tsdn, ptr);
+	} else {
+		arena_dalloc_large_no_tcache(tsdn, ptr, szind);
+	}
+}
+
+JEMALLOC_ALWAYS_INLINE void
+arena_dalloc_large(tsdn_t *tsdn, void *ptr, tcache_t *tcache, szind_t szind,
+    bool slow_path) {
+	if (szind < nhbins) {
+		if (config_prof && unlikely(szind < SC_NBINS)) {
+			arena_dalloc_promoted(tsdn, ptr, tcache, slow_path);
+		} else {
+			tcache_dalloc_large(tsdn_tsd(tsdn), tcache, ptr, szind,
+			    slow_path);
+		}
 	} else {
 		extent_t *extent = iealloc(tsdn, ptr);
 		large_dalloc(tsdn, extent);
@@ -271,18 +325,7 @@ arena_dalloc(tsdn_t *tsdn, void *ptr, tcache_t *tcache,
 		tcache_dalloc_small(tsdn_tsd(tsdn), tcache, ptr, szind,
 		    slow_path);
 	} else {
-		if (szind < nhbins) {
-			if (config_prof && unlikely(szind < SC_NBINS)) {
-				arena_dalloc_promoted(tsdn, ptr, tcache,
-				    slow_path);
-			} else {
-				tcache_dalloc_large(tsdn_tsd(tsdn), tcache, ptr,
-				    szind, slow_path);
-			}
-		} else {
-			extent_t *extent = iealloc(tsdn, ptr);
-			large_dalloc(tsdn, extent);
-		}
+		arena_dalloc_large(tsdn, ptr, tcache, szind, slow_path);
 	}
 }
 
@@ -325,8 +368,7 @@ arena_sdalloc_no_tcache(tsdn_t *tsdn, void *ptr, size_t size) {
 		/* Small allocation. */
 		arena_dalloc_small(tsdn, ptr);
 	} else {
-		extent_t *extent = iealloc(tsdn, ptr);
-		large_dalloc(tsdn, extent);
+		arena_dalloc_large_no_tcache(tsdn, ptr, szind);
 	}
 }
 
@@ -383,18 +425,7 @@ arena_sdalloc(tsdn_t *tsdn, void *ptr, size_t size, tcache_t *tcache,
 		tcache_dalloc_small(tsdn_tsd(tsdn), tcache, ptr, szind,
 		    slow_path);
 	} else {
-		if (szind < nhbins) {
-			if (config_prof && unlikely(szind < SC_NBINS)) {
-				arena_dalloc_promoted(tsdn, ptr, tcache,
-				    slow_path);
-			} else {
-				tcache_dalloc_large(tsdn_tsd(tsdn),
-				    tcache, ptr, szind, slow_path);
-			}
-		} else {
-			extent_t *extent = iealloc(tsdn, ptr);
-			large_dalloc(tsdn, extent);
-		}
+		arena_dalloc_large(tsdn, ptr, tcache, szind, slow_path);
 	}
 }
 

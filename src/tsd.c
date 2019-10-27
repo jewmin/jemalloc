@@ -17,11 +17,11 @@ JEMALLOC_DIAGNOSTIC_PUSH
 JEMALLOC_DIAGNOSTIC_IGNORE_MISSING_STRUCT_FIELD_INITIALIZERS
 
 #ifdef JEMALLOC_MALLOC_THREAD_CLEANUP
-__thread tsd_t JEMALLOC_TLS_MODEL tsd_tls = TSD_INITIALIZER;
-__thread bool JEMALLOC_TLS_MODEL tsd_initialized = false;
+JEMALLOC_TSD_TYPE_ATTR(tsd_t) tsd_tls = TSD_INITIALIZER;
+JEMALLOC_TSD_TYPE_ATTR(bool) JEMALLOC_TLS_MODEL tsd_initialized = false;
 bool tsd_booted = false;
 #elif (defined(JEMALLOC_TLS))
-__thread tsd_t JEMALLOC_TLS_MODEL tsd_tls = TSD_INITIALIZER;
+JEMALLOC_TSD_TYPE_ATTR(tsd_t) tsd_tls = TSD_INITIALIZER;
 pthread_key_t tsd_tsd;
 bool tsd_booted = false;
 #elif (defined(_WIN32))
@@ -113,9 +113,9 @@ tsd_force_recompute(tsdn_t *tsdn) {
 	malloc_mutex_lock(tsdn, &tsd_nominal_tsds_lock);
 	tsd_t *remote_tsd;
 	ql_foreach(remote_tsd, &tsd_nominal_tsds, TSD_MANGLE(tcache).tsd_link) {
-		assert(atomic_load_u8(&remote_tsd->state, ATOMIC_RELAXED)
+		assert(tsd_atomic_load(&remote_tsd->state, ATOMIC_RELAXED)
 		    <= tsd_state_nominal_max);
-		atomic_store_u8(&remote_tsd->state, tsd_state_nominal_recompute,
+		tsd_atomic_store(&remote_tsd->state, tsd_state_nominal_recompute,
 		    ATOMIC_RELAXED);
 	}
 	malloc_mutex_unlock(tsdn, &tsd_nominal_tsds_lock);
@@ -172,7 +172,7 @@ tsd_slow_update(tsd_t *tsd) {
 	uint8_t old_state;
 	do {
 		uint8_t new_state = tsd_state_compute(tsd);
-		old_state = atomic_exchange_u8(&tsd->state, new_state,
+		old_state = tsd_atomic_exchange(&tsd->state, new_state,
 		    ATOMIC_ACQUIRE);
 	} while (old_state == tsd_state_nominal_recompute);
 }
@@ -181,14 +181,14 @@ void
 tsd_state_set(tsd_t *tsd, uint8_t new_state) {
 	/* Only the tsd module can change the state *to* recompute. */
 	assert(new_state != tsd_state_nominal_recompute);
-	uint8_t old_state = atomic_load_u8(&tsd->state, ATOMIC_RELAXED);
+	uint8_t old_state = tsd_atomic_load(&tsd->state, ATOMIC_RELAXED);
 	if (old_state > tsd_state_nominal_max) {
 		/*
 		 * Not currently in the nominal list, but it might need to be
 		 * inserted there.
 		 */
 		assert(!tsd_in_nominal_list(tsd));
-		atomic_store_u8(&tsd->state, new_state, ATOMIC_RELAXED);
+		tsd_atomic_store(&tsd->state, new_state, ATOMIC_RELAXED);
 		if (new_state <= tsd_state_nominal_max) {
 			tsd_add_nominal(tsd);
 		}
@@ -201,7 +201,8 @@ tsd_state_set(tsd_t *tsd, uint8_t new_state) {
 		assert(tsd_in_nominal_list(tsd));
 		if (new_state > tsd_state_nominal_max) {
 			tsd_remove_nominal(tsd);
-			atomic_store_u8(&tsd->state, new_state, ATOMIC_RELAXED);
+			tsd_atomic_store(&tsd->state, new_state,
+			    ATOMIC_RELAXED);
 		} else {
 			/*
 			 * This is the tricky case.  We're transitioning from
@@ -280,11 +281,13 @@ tsd_fetch_slow(tsd_t *tsd, bool minimal) {
 		tsd_slow_update(tsd);
 	} else if (tsd_state_get(tsd) == tsd_state_uninitialized) {
 		if (!minimal) {
-			tsd_state_set(tsd, tsd_state_nominal);
-			tsd_slow_update(tsd);
-			/* Trigger cleanup handler registration. */
-			tsd_set(tsd);
-			tsd_data_init(tsd);
+			if (tsd_booted) {
+				tsd_state_set(tsd, tsd_state_nominal);
+				tsd_slow_update(tsd);
+				/* Trigger cleanup handler registration. */
+				tsd_set(tsd);
+				tsd_data_init(tsd);
+			}
 		} else {
 			tsd_state_set(tsd, tsd_state_minimal_initialized);
 			tsd_set(tsd);
@@ -470,7 +473,7 @@ _tls_callback(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 #    pragma comment(linker, "/INCLUDE:_tls_callback")
 #  else
 #    pragma comment(linker, "/INCLUDE:_tls_used")
-#    pragma comment(linker, "/INCLUDE:tls_callback")
+#    pragma comment(linker, "/INCLUDE:" STRINGIFY(tls_callback) )
 #  endif
 #  pragma section(".CRT$XLY",long,read)
 #endif

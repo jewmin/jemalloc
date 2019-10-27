@@ -55,7 +55,8 @@ malloc_mutex_lock_slow(malloc_mutex_t *mutex) {
 	int cnt = 0, max_cnt = MALLOC_MUTEX_MAX_SPIN;
 	do {
 		spin_cpu_spinwait();
-		if (!malloc_mutex_trylock_final(mutex)) {
+		if (!atomic_load_b(&mutex->locked, ATOMIC_RELAXED)
+                    && !malloc_mutex_trylock_final(mutex)) {
 			data->n_spin_acquired++;
 			return;
 		}
@@ -144,9 +145,7 @@ malloc_mutex_init(malloc_mutex_t *mutex, const char *name,
 	}
 #  endif
 #elif (defined(JEMALLOC_OS_UNFAIR_LOCK))
-	mutex->lock = OS_UNFAIR_LOCK_INIT;
-#elif (defined(JEMALLOC_OSSPIN))
-	mutex->lock = 0;
+       mutex->lock = OS_UNFAIR_LOCK_INIT;
 #elif (defined(JEMALLOC_MUTEX_INIT_CB))
 	if (postpone_init) {
 		mutex->postponed_next = postponed_mutexes;

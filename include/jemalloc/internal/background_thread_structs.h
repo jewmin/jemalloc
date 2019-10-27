@@ -9,6 +9,7 @@
 
 #define BACKGROUND_THREAD_INDEFINITE_SLEEP UINT64_MAX
 #define MAX_BACKGROUND_THREAD_LIMIT MALLOCX_ARENA_LIMIT
+#define DEFAULT_NUM_BACKGROUND_THREAD 4
 
 typedef enum {
 	background_thread_stopped,
@@ -47,6 +48,7 @@ struct background_thread_stats_s {
 	size_t num_threads;
 	uint64_t num_runs;
 	nstime_t run_interval;
+	mutex_prof_data_t max_counter_per_bg_thd;
 };
 typedef struct background_thread_stats_s background_thread_stats_t;
 

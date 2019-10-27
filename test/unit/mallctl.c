@@ -159,12 +159,13 @@ TEST_BEGIN(test_mallctl_opt) {
 
 	TEST_MALLCTL_OPT(bool, abort, always);
 	TEST_MALLCTL_OPT(bool, abort_conf, always);
+	TEST_MALLCTL_OPT(bool, confirm_conf, always);
 	TEST_MALLCTL_OPT(const char *, metadata_thp, always);
 	TEST_MALLCTL_OPT(bool, retain, always);
 	TEST_MALLCTL_OPT(const char *, dss, always);
 	TEST_MALLCTL_OPT(unsigned, narenas, always);
 	TEST_MALLCTL_OPT(const char *, percpu_arena, always);
-	TEST_MALLCTL_OPT(size_t, experimental_huge_threshold, always);
+	TEST_MALLCTL_OPT(size_t, oversize_threshold, always);
 	TEST_MALLCTL_OPT(bool, background_thread, always);
 	TEST_MALLCTL_OPT(ssize_t, dirty_decay_ms, always);
 	TEST_MALLCTL_OPT(ssize_t, muzzy_decay_ms, always);
@@ -342,7 +343,7 @@ TEST_BEGIN(test_thread_arena) {
 	sz = sizeof(unsigned);
 	assert_d_eq(mallctl("arenas.narenas", (void *)&narenas, &sz, NULL, 0),
 	    0, "Unexpected mallctl() failure");
-	if (opt_huge_threshold != 0) {
+	if (opt_oversize_threshold != 0) {
 		narenas--;
 	}
 	assert_u_eq(narenas, opt_narenas, "Number of arenas incorrect");
@@ -706,6 +707,7 @@ TEST_BEGIN(test_arenas_bin_constants) {
 	TEST_ARENAS_BIN_CONSTANT(uint32_t, nregs, bin_infos[0].nregs);
 	TEST_ARENAS_BIN_CONSTANT(size_t, slab_size,
 	    bin_infos[0].slab_size);
+	TEST_ARENAS_BIN_CONSTANT(uint32_t, nshards, bin_infos[0].n_shards);
 
 #undef TEST_ARENAS_BIN_CONSTANT
 }
@@ -757,6 +759,32 @@ TEST_BEGIN(test_arenas_lookup) {
 	    0, "Unexpected mallctl() failure");
 	assert_u_eq(arena, arena1, "Unexpected arena index");
 	dallocx(ptr, 0);
+}
+TEST_END
+
+TEST_BEGIN(test_prof_active) {
+	/*
+	 * If config_prof is off, then the test for prof_active in
+	 * test_mallctl_opt was already enough.
+	 */
+	test_skip_if(!config_prof);
+
+	bool active, old;
+	size_t len = sizeof(bool);
+
+	active = true;
+	assert_d_eq(mallctl("prof.active", NULL, NULL, &active, len), ENOENT,
+	    "Setting prof_active to true should fail when opt_prof is off");
+	old = true;
+	assert_d_eq(mallctl("prof.active", &old, &len, &active, len), ENOENT,
+	    "Setting prof_active to true should fail when opt_prof is off");
+	assert_true(old, "old valud should not be touched when mallctl fails");
+	active = false;
+	assert_d_eq(mallctl("prof.active", NULL, NULL, &active, len), 0,
+	    "Setting prof_active to false should succeed when opt_prof is off");
+	assert_d_eq(mallctl("prof.active", &old, &len, &active, len), 0,
+	    "Setting prof_active to false should succeed when opt_prof is off");
+	assert_false(old, "prof_active should be false when opt_prof is off");
 }
 TEST_END
 
@@ -880,6 +908,7 @@ main(void) {
 	    test_arenas_lextent_constants,
 	    test_arenas_create,
 	    test_arenas_lookup,
+	    test_prof_active,
 	    test_stats_arenas,
 	    test_hooks,
 	    test_hooks_exhaustion);

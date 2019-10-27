@@ -13,7 +13,7 @@ JEMALLOC_DIAGNOSTIC_DISABLE_SPURIOUS
 #define BACKGROUND_THREAD_DEFAULT false
 /* Read-only after initialization. */
 bool opt_background_thread = BACKGROUND_THREAD_DEFAULT;
-size_t opt_max_background_threads = MAX_BACKGROUND_THREAD_LIMIT;
+size_t opt_max_background_threads = MAX_BACKGROUND_THREAD_LIMIT + 1;
 
 /* Used for thread creation, termination and stats. */
 malloc_mutex_t background_thread_lock;
@@ -27,7 +27,6 @@ background_thread_info_t *background_thread_info;
 /******************************************************************************/
 
 #ifdef JEMALLOC_PTHREAD_CREATE_WRAPPER
-#include <dlfcn.h>
 
 static int (*pthread_create_fptr)(pthread_t *__restrict, const pthread_attr_t *,
     void *(*)(void *), void *__restrict);
@@ -115,7 +114,7 @@ decay_npurge_after_interval(arena_decay_t *decay, size_t interval) {
 
 static uint64_t
 arena_decay_compute_purge_interval_impl(tsdn_t *tsdn, arena_decay_t *decay,
-    extents_t *extents) {
+    eset_t *eset) {
 	if (malloc_mutex_trylock(tsdn, &decay->mtx)) {
 		/* Use minimal interval if decay is contended. */
 		return BACKGROUND_THREAD_MIN_INTERVAL_NS;
@@ -131,7 +130,7 @@ arena_decay_compute_purge_interval_impl(tsdn_t *tsdn, arena_decay_t *decay,
 
 	uint64_t decay_interval_ns = nstime_ns(&decay->interval);
 	assert(decay_interval_ns > 0);
-	size_t npages = extents_npages_get(extents);
+	size_t npages = eset_npages_get(eset);
 	if (npages == 0) {
 		unsigned i;
 		for (i = 0; i < SMOOTHSTEP_NSTEPS; i++) {
@@ -203,12 +202,12 @@ static uint64_t
 arena_decay_compute_purge_interval(tsdn_t *tsdn, arena_t *arena) {
 	uint64_t i1, i2;
 	i1 = arena_decay_compute_purge_interval_impl(tsdn, &arena->decay_dirty,
-	    &arena->extents_dirty);
+	    &arena->eset_dirty);
 	if (i1 == BACKGROUND_THREAD_MIN_INTERVAL_NS) {
 		return i1;
 	}
 	i2 = arena_decay_compute_purge_interval_impl(tsdn, &arena->decay_muzzy,
-	    &arena->extents_muzzy);
+	    &arena->eset_muzzy);
 
 	return i1 < i2 ? i1 : i2;
 }
@@ -509,6 +508,8 @@ background_thread_entry(void *ind_arg) {
 	assert(thread_ind < max_background_threads);
 #ifdef JEMALLOC_HAVE_PTHREAD_SETNAME_NP
 	pthread_setname_np(pthread_self(), "jemalloc_bg_thd");
+#elif defined(__FreeBSD__)
+	pthread_set_name_np(pthread_self(), "jemalloc_bg_thd");
 #endif
 	if (opt_percpu_arena != percpu_arena_disabled) {
 		set_current_thread_affinity((int)thread_ind);
@@ -533,9 +534,8 @@ background_thread_init(tsd_t *tsd, background_thread_info_t *info) {
 	n_background_threads++;
 }
 
-/* Create a new background thread if needed. */
-bool
-background_thread_create(tsd_t *tsd, unsigned arena_ind) {
+static bool
+background_thread_create_locked(tsd_t *tsd, unsigned arena_ind) {
 	assert(have_background_thread);
 	malloc_mutex_assert_owner(tsd_tsdn(tsd), &background_thread_lock);
 
@@ -588,6 +588,19 @@ background_thread_create(tsd_t *tsd, unsigned arena_ind) {
 	return false;
 }
 
+/* Create a new background thread if needed. */
+bool
+background_thread_create(tsd_t *tsd, unsigned arena_ind) {
+	assert(have_background_thread);
+
+	bool ret;
+	malloc_mutex_lock(tsd_tsdn(tsd), &background_thread_lock);
+	ret = background_thread_create_locked(tsd, arena_ind);
+	malloc_mutex_unlock(tsd_tsdn(tsd), &background_thread_lock);
+
+	return ret;
+}
+
 bool
 background_threads_enable(tsd_t *tsd) {
 	assert(n_background_threads == 0);
@@ -621,7 +634,7 @@ background_threads_enable(tsd_t *tsd) {
 		}
 	}
 
-	return background_thread_create(tsd, 0);
+	return background_thread_create_locked(tsd, 0);
 }
 
 bool
@@ -705,8 +718,8 @@ background_thread_interval_check(tsdn_t *tsdn, arena_t *arena,
 	if (info->npages_to_purge_new > BACKGROUND_THREAD_NPAGES_THRESHOLD) {
 		should_signal = true;
 	} else if (unlikely(background_thread_indefinite_sleep(info)) &&
-	    (extents_npages_get(&arena->extents_dirty) > 0 ||
-	    extents_npages_get(&arena->extents_muzzy) > 0 ||
+	    (eset_npages_get(&arena->eset_dirty) > 0 ||
+	    eset_npages_get(&arena->eset_muzzy) > 0 ||
 	    info->npages_to_purge_new > 0)) {
 		should_signal = true;
 	} else {
@@ -781,15 +794,25 @@ background_thread_stats_read(tsdn_t *tsdn, background_thread_stats_t *stats) {
 		return true;
 	}
 
-	stats->num_threads = n_background_threads;
-	uint64_t num_runs = 0;
 	nstime_init(&stats->run_interval, 0);
+	memset(&stats->max_counter_per_bg_thd, 0, sizeof(mutex_prof_data_t));
+
+	uint64_t num_runs = 0;
+	stats->num_threads = n_background_threads;
 	for (unsigned i = 0; i < max_background_threads; i++) {
 		background_thread_info_t *info = &background_thread_info[i];
-		malloc_mutex_lock(tsdn, &info->mtx);
+		if (malloc_mutex_trylock(tsdn, &info->mtx)) {
+			/*
+			 * Each background thread run may take a long time;
+			 * avoid waiting on the stats if the thread is active.
+			 */
+			continue;
+		}
 		if (info->state != background_thread_stopped) {
 			num_runs += info->tot_n_runs;
 			nstime_add(&stats->run_interval, &info->tot_sleep_time);
+			malloc_mutex_prof_max_update(tsdn,
+			    &stats->max_counter_per_bg_thd, &info->mtx);
 		}
 		malloc_mutex_unlock(tsdn, &info->mtx);
 	}
@@ -806,6 +829,10 @@ background_thread_stats_read(tsdn_t *tsdn, background_thread_stats_t *stats) {
 #undef BILLION
 #undef BACKGROUND_THREAD_MIN_INTERVAL_NS
 
+#ifdef JEMALLOC_HAVE_DLSYM
+#include <dlfcn.h>
+#endif
+
 static bool
 pthread_create_fptr_init(void) {
 	if (pthread_create_fptr != NULL) {
@@ -816,7 +843,11 @@ pthread_create_fptr_init(void) {
 	 * wrapper for pthread_create; and 2) application may define its own
 	 * wrapper as well (and can call malloc within the wrapper).
 	 */
+#ifdef JEMALLOC_HAVE_DLSYM
 	pthread_create_fptr = dlsym(RTLD_NEXT, "pthread_create");
+#else
+	pthread_create_fptr = NULL;
+#endif
 	if (pthread_create_fptr == NULL) {
 		if (config_lazy_lock) {
 			malloc_write("<jemalloc>: Error in dlsym(RTLD_NEXT, "
@@ -870,9 +901,8 @@ background_thread_boot1(tsdn_t *tsdn) {
 	assert(have_background_thread);
 	assert(narenas_total_get() > 0);
 
-	if (opt_max_background_threads == MAX_BACKGROUND_THREAD_LIMIT &&
-	    ncpus < MAX_BACKGROUND_THREAD_LIMIT) {
-		opt_max_background_threads = ncpus;
+	if (opt_max_background_threads > MAX_BACKGROUND_THREAD_LIMIT) {
+		opt_max_background_threads = DEFAULT_NUM_BACKGROUND_THREAD;
 	}
 	max_background_threads = opt_max_background_threads;
 

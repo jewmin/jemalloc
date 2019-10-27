@@ -9,14 +9,11 @@ If building from unpackaged developer sources, the simplest command sequence
 that might work is:
 
     ./autogen.sh
-    make dist
     make
     make install
 
-Note that documentation is not built by the default target because doing so
-would create a dependency on xsltproc in packaged releases, hence the
-requirement to either run 'make dist' or avoid installing docs via the various
-install_* targets documented below.
+Note that documentation is built by the default target only when xsltproc is
+available.  Build will warn but not stop if the dependency is missing.
 
 
 ## Advanced configuration
@@ -268,6 +265,11 @@ any of the following arguments (not a definitive list) to 'configure':
     Note that in this case, there will be two malloc implementations operating
     in the same process, which will almost certainly result in confusing runtime
     crashes if pointers leak from one implementation to the other.
+
+* `--disable-libdl`
+
+    Disable the usage of libdl, namely dlsym(3) which is required by the lazy
+    lock option.  This can allow building static binaries.
 
 The following environment variables (not a definitive list) impact configure's
 behavior:

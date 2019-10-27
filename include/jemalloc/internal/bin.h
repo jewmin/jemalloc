@@ -2,6 +2,8 @@
 #define JEMALLOC_INTERNAL_BIN_H
 
 #include "jemalloc/internal/bin_stats.h"
+#include "jemalloc/internal/bin_types.h"
+#include "jemalloc/internal/extent.h"
 #include "jemalloc/internal/extent_types.h"
 #include "jemalloc/internal/extent_structs.h"
 #include "jemalloc/internal/mutex.h"
@@ -11,47 +13,6 @@
  * A bin contains a set of extents that are currently being used for slab
  * allocations.
  */
-
-/*
- * Read-only information associated with each element of arena_t's bins array
- * is stored separately, partly to reduce memory usage (only one copy, rather
- * than one per arena), but mainly to avoid false cacheline sharing.
- *
- * Each slab has the following layout:
- *
- *   /--------------------\
- *   | region 0           |
- *   |--------------------|
- *   | region 1           |
- *   |--------------------|
- *   | ...                |
- *   | ...                |
- *   | ...                |
- *   |--------------------|
- *   | region nregs-1     |
- *   \--------------------/
- */
-typedef struct bin_info_s bin_info_t;
-struct bin_info_s {
-	/* Size of regions in a slab for this bin's size class. */
-	size_t			reg_size;
-
-	/* Total size of a slab for this bin's size class. */
-	size_t			slab_size;
-
-	/* Total number of regions in a slab for this bin's size class. */
-	uint32_t		nregs;
-
-	/*
-	 * Metadata used to manipulate bitmaps for slabs associated with this
-	 * bin.
-	 */
-	bitmap_info_t		bitmap_info;
-};
-
-extern bin_info_t bin_infos[SC_NBINS];
-
-
 typedef struct bin_s bin_t;
 struct bin_s {
 	/* All operations on bin_t fields require lock ownership. */
@@ -79,8 +40,16 @@ struct bin_s {
 	bin_stats_t	stats;
 };
 
-void bin_infos_init(sc_data_t *sc_data, bin_info_t bin_infos[SC_NBINS]);
-void bin_boot();
+/* A set of sharded bins of the same size class. */
+typedef struct bins_s bins_t;
+struct bins_s {
+	/* Sharded bins.  Dynamically sized. */
+	bin_t *bin_shards;
+};
+
+void bin_shard_sizes_boot(unsigned bin_shards[SC_NBINS]);
+bool bin_update_shard_size(unsigned bin_shards[SC_NBINS], size_t start_size,
+    size_t end_size, size_t nshards);
 
 /* Initializes a bin to empty.  Returns true on error. */
 bool bin_init(bin_t *bin);
@@ -94,7 +63,7 @@ void bin_postfork_child(tsdn_t *tsdn, bin_t *bin);
 static inline void
 bin_stats_merge(tsdn_t *tsdn, bin_stats_t *dst_bin_stats, bin_t *bin) {
 	malloc_mutex_lock(tsdn, &bin->lock);
-	malloc_mutex_prof_read(tsdn, &dst_bin_stats->mutex_data, &bin->lock);
+	malloc_mutex_prof_accum(tsdn, &dst_bin_stats->mutex_data, &bin->lock);
 	dst_bin_stats->nmalloc += bin->stats.nmalloc;
 	dst_bin_stats->ndalloc += bin->stats.ndalloc;
 	dst_bin_stats->nrequests += bin->stats.nrequests;
@@ -104,6 +73,7 @@ bin_stats_merge(tsdn_t *tsdn, bin_stats_t *dst_bin_stats, bin_t *bin) {
 	dst_bin_stats->nslabs += bin->stats.nslabs;
 	dst_bin_stats->reslabs += bin->stats.reslabs;
 	dst_bin_stats->curslabs += bin->stats.curslabs;
+	dst_bin_stats->nonfull_slabs += bin->stats.nonfull_slabs;
 	malloc_mutex_unlock(tsdn, &bin->lock);
 }
 

@@ -3,6 +3,7 @@
 
 #include "jemalloc/internal/arena_types.h"
 #include "jemalloc/internal/assert.h"
+#include "jemalloc/internal/bin_types.h"
 #include "jemalloc/internal/jemalloc_internal_externs.h"
 #include "jemalloc/internal/prof_types.h"
 #include "jemalloc/internal/ql.h"
@@ -17,8 +18,9 @@
  * --- data accessed on tcache fast path: state, rtree_ctx, stats, prof ---
  * s: state
  * e: tcache_enabled
- * m: thread_allocated (config_stats)
- * f: thread_deallocated (config_stats)
+ * m: thread_allocated
+ * f: thread_deallocated
+ * b: bytes_until_sample (config_prof)
  * p: prof_tdata (config_prof)
  * c: rtree_ctx (rtree cache accessed on deallocation)
  * t: tcache
@@ -26,6 +28,7 @@
  * d: arenas_tdata_bypass
  * r: reentrancy_level
  * x: narenas_tdata
+ * v: offset_state
  * i: iarena
  * a: arena
  * o: arenas_tdata
@@ -34,11 +37,13 @@
  * Use a compact layout to reduce cache footprint.
  * +--- 64-bit and 64B cacheline; 1B each letter; First byte on the left. ---+
  * |----------------------------  1st cacheline  ----------------------------|
- * | sedrxxxx mmmmmmmm ffffffff pppppppp [c * 32  ........ ........ .......] |
+ * | sedrxxxx vvvvvvvv mmmmmmmm ffffffff bbbbbbbb pppppppp [c * 16  .......] |
  * |----------------------------  2nd cacheline  ----------------------------|
  * | [c * 64  ........ ........ ........ ........ ........ ........ .......] |
  * |----------------------------  3nd cacheline  ----------------------------|
- * | [c * 32  ........ ........ .......] iiiiiiii aaaaaaaa oooooooo [t...... |
+ * | [c * 48  ........ ........ ........ ........ .......] iiiiiiii aaaaaaaa |
+ * +----------------------------  4th cacheline  ----------------------------+
+ * | oooooooo [t...... ........ ........ ........ ........ ........ ........ |
  * +-------------------------------------------------------------------------+
  * Note: the entire tcache is embedded into TSD and spans multiple cachelines.
  *
@@ -68,11 +73,13 @@ typedef void (*test_callback_t)(int *);
     O(offset_state,		uint64_t,		uint64_t)	\
     O(thread_allocated,		uint64_t,		uint64_t)	\
     O(thread_deallocated,	uint64_t,		uint64_t)	\
+    O(bytes_until_sample,	int64_t,		int64_t)	\
     O(prof_tdata,		prof_tdata_t *,		prof_tdata_t *)	\
     O(rtree_ctx,		rtree_ctx_t,		rtree_ctx_t)	\
     O(iarena,			arena_t *,		arena_t *)	\
     O(arena,			arena_t *,		arena_t *)	\
     O(arenas_tdata,		arena_tdata_t *,	arena_tdata_t *)\
+    O(binshards,		tsd_binshards_t,	tsd_binshards_t)\
     O(tcache,			tcache_t,		tcache_t)	\
     O(witness_tsd,              witness_tsd_t,		witness_tsdn_t)	\
     MALLOC_TEST_TSD
@@ -86,11 +93,13 @@ typedef void (*test_callback_t)(int *);
     0,									\
     0,									\
     0,									\
+    0,									\
     NULL,								\
     RTREE_CTX_ZERO_INITIALIZER,						\
     NULL,								\
     NULL,								\
     NULL,								\
+    TSD_BINSHARDS_ZERO_INITIALIZER,					\
     TCACHE_ZERO_INITIALIZER,						\
     WITNESS_TSD_INITIALIZER						\
     MALLOC_TEST_TSD_INITIALIZER						\
@@ -164,6 +173,18 @@ enum {
  */
 #define TSD_MANGLE(n) cant_access_tsd_items_directly_use_a_getter_or_setter_##n
 
+#ifdef JEMALLOC_U8_ATOMICS
+#  define tsd_state_t atomic_u8_t
+#  define tsd_atomic_load atomic_load_u8
+#  define tsd_atomic_store atomic_store_u8
+#  define tsd_atomic_exchange atomic_exchange_u8
+#else
+#  define tsd_state_t atomic_u32_t
+#  define tsd_atomic_load atomic_load_u32
+#  define tsd_atomic_store atomic_store_u32
+#  define tsd_atomic_exchange atomic_exchange_u32
+#endif
+
 /* The actual tsd. */
 struct tsd_s {
 	/*
@@ -172,8 +193,11 @@ struct tsd_s {
 	 * setters below.
 	 */
 
-	/* We manually limit the state to just a single byte. */
-	atomic_u8_t state;
+	/*
+	 * We manually limit the state to just a single byte.  Unless the 8-bit
+	 * atomics are unavailable (which is rare).
+	 */
+	tsd_state_t state;
 #define O(n, t, nt)							\
 	t TSD_MANGLE(n);
 MALLOC_TSD
